@@ -5,6 +5,9 @@ from scipy.sparse import coo_matrix
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import OneHotEncoder
 from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.utils.data import RandomSampler
+from torch.utils.data.distributed import DistributedSampler
 
 def get_adj_matrix(n_nodes, batch_size, edge_mask):
     rows, cols = [], []
@@ -63,20 +66,58 @@ def retrieve_dataloaders(batch_size, num_data = -1, use_one_hot = True, cache_di
                                      value['nodes'], value['atom_mask'])
                 for split, value in data.items()}
 
-    # distributed training
-    train_sampler = DistributedSampler(datasets['train'], shuffle=True)
-    # Construct PyTorch dataloaders from datasets
-    dataloaders = {split: DataLoader(dataset,
-                                     batch_size=batch_size if (split == 'train') else batch_size,
-                                     sampler=train_sampler if (split == 'train') else DistributedSampler(dataset, shuffle=False),
-                                     pin_memory=True,
-                                     persistent_workers=True,
-                                     drop_last=True if (split == 'train') else False,
-                                     num_workers=num_workers,
-                                     collate_fn=collate_fn)
-                        for split, dataset in datasets.items()}
+
+
+    # Detectar si DDP está activo
+    use_ddp = dist.is_available() and dist.is_initialized()
+
+    if use_ddp:
+        
+        train_sampler = DistributedSampler(datasets['train'], shuffle=True)
+        val_sampler   = DistributedSampler(datasets['val'], shuffle=False)
+        test_sampler  = DistributedSampler(datasets['test'], shuffle=False)
+    else:
+        # En ejecución de 1 GPU (sin DDP)
+        train_sampler = RandomSampler(datasets['train'])
+        val_sampler   = None
+        test_sampler  = None
+
+    # Construct PyTorch dataloaders desde datasets
+    dataloaders = {
+        'train': DataLoader(
+            datasets['train'],
+            batch_size=batch_size,
+            sampler=train_sampler,
+            pin_memory=True,
+            persistent_workers=True,
+            drop_last=True,
+            num_workers=num_workers,
+            collate_fn=collate_fn
+        ),
+        'val': DataLoader(
+            datasets['val'],
+            batch_size=batch_size,
+            sampler=val_sampler,
+            pin_memory=True,
+            persistent_workers=True,
+            drop_last=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn
+        ),
+        'test': DataLoader(
+            datasets['test'],
+            batch_size=batch_size,
+            sampler=test_sampler,
+            pin_memory=True,
+            persistent_workers=True,
+            drop_last=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn
+        )
+    }
 
     return train_sampler, dataloaders
+
 
 if __name__ == '__main__':
     train_sampler, dataloaders = retrieve_dataloaders(32, 100)

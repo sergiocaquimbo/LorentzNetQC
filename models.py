@@ -1,5 +1,7 @@
 import torch
 from torch import nn
+
+
 class LGEB(nn.Module):
     def __init__(self, n_input, n_output, n_hidden, n_node_attr=0,
                  dropout = 0., c_weight=1.0, last_layer=False):

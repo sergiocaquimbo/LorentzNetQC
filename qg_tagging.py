@@ -1,3 +1,6 @@
+import os
+import random
+from datetime import timedelta
 from qg import dataset
 from models import LorentzNet
 import torch
@@ -8,6 +11,15 @@ import numpy as np
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+def reduce_sum_safe(x):
+    # Devuelve suma global si hay DDP; si no, devuelve x local en tensor
+    if dist.is_available() and dist.is_initialized():
+    # if ('RANK' in os.environ) and ('WORLD_SIZE' in os.environ):
+        return utils.sum_reduce(x, device=device)
+    else:
+        return torch.as_tensor(x, device=device, dtype=torch.float32)
+
 
 parser = argparse.ArgumentParser(description='Quark-gluon tagging')
 parser.add_argument('--exp_name', type=str, default='', metavar='N',
@@ -45,11 +57,16 @@ parser.add_argument('--num_workers', type=int, default=4, metavar='N',
 parser.add_argument('--weight_decay', type=float, default=1e-2, metavar='N',
                     help='weight decay')
 
-parser.add_argument('--local_rank', type=int, default=0)
+# parser.add_argument('--local_rank', type=int, default=0)
+
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(local_rank)
+parser.add_argument('--local_rank', type=int, default=local_rank)
 
 def run(epoch, loader, partition):
     if partition == 'train':
-        train_sampler.set_epoch(epoch)
+        if hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(epoch)
         ddp_model.train()
     else:
         ddp_model.eval()
@@ -99,10 +116,15 @@ def run(epoch, loader, partition):
             running_loss = sum(res['loss_arr'][-args.log_interval:])/len(res['loss_arr'][-args.log_interval:])
             running_acc = sum(res['correct_arr'][-args.log_interval:])/(len(res['correct_arr'][-args.log_interval:])*batch_size)
             avg_time = res['time']/res['counter'] * batch_size
-            tmp_counter = utils.sum_reduce(res['counter'], device = device)
-            tmp_loss = utils.sum_reduce(res['loss'], device = device) / tmp_counter
-            tmp_acc = utils.sum_reduce(res['correct'], device = device) / tmp_counter
-            if (args.local_rank == 0):
+            # tmp_counter = utils.sum_reduce(res['counter'], device = device)
+            # tmp_loss = utils.sum_reduce(res['loss'], device = device) / tmp_counter
+            # tmp_acc = utils.sum_reduce(res['correct'], device = device) / tmp_counter
+
+            tmp_counter = reduce_sum_safe(res['counter'])
+            tmp_loss    = reduce_sum_safe(res['loss']) / tmp_counter
+            tmp_acc     = reduce_sum_safe(res['correct']) / tmp_counter
+
+            if (local_rank == 0):
                 print(">> %s \t Epoch %d/%d \t Batch %d/%d \t Loss %.4f \t Running Acc %.3f \t Total Acc %.3f \t Avg Batch Time %.4f" %
                      (partition, epoch + 1, args.epochs, i, loader_length, running_loss, running_acc, tmp_acc, avg_time))
 
@@ -112,9 +134,14 @@ def run(epoch, loader, partition):
         res['label'] = torch.cat(res['label']).unsqueeze(-1)
         res['score'] = torch.cat(res['score'])
         res['score'] = torch.cat((res['label'],res['score']),dim=-1)
-    res['counter'] = utils.sum_reduce(res['counter'], device = device).item()
-    res['loss'] = utils.sum_reduce(res['loss'], device = device).item() / res['counter']
-    res['acc'] = utils.sum_reduce(res['correct'], device = device).item() / res['counter']
+    # res['counter'] = utils.sum_reduce(res['counter'], device = device).item()
+    # res['loss'] = utils.sum_reduce(res['loss'], device = device).item() / res['counter']
+    # res['acc'] = utils.sum_reduce(res['correct'], device = device).item() / res['counter']
+
+    res['counter'] = reduce_sum_safe(res['counter']).item()
+    res['loss']    = reduce_sum_safe(res['loss']).item() / res['counter']
+    res['acc']     = reduce_sum_safe(res['correct']).item() / res['counter']
+
     return res
 
 def train(res):
@@ -123,12 +150,14 @@ def train(res):
         train_res = run(epoch, dataloaders['train'], partition='train')
         print("Time: train: %.2f \t Train loss %.4f \t Train acc: %.4f" % (train_res['time'],train_res['loss'],train_res['acc']))
         if epoch % args.val_interval == 0:
-            if (args.local_rank == 0):
+            if (local_rank == 0):
                 torch.save(ddp_model.state_dict(), f"{args.logdir}/{args.exp_name}/checkpoint-epoch-{epoch}.pt")
-            dist.barrier() # wait master to save model
+            if use_ddp:
+                dist.barrier() # wait master to save model
+
             with torch.no_grad():
                 val_res = run(epoch, dataloaders['val'], partition='val')
-            if (args.local_rank == 0): # only master process save
+            if (local_rank == 0): # only master process save
                 res['lr'].append(optimizer.param_groups[0]['lr'])
                 res['train_time'].append(train_res['time'])
                 res['val_time'].append(val_res['time'])
@@ -162,7 +191,8 @@ def train(res):
             for g in optimizer.param_groups:
                 g['lr'] = g['lr']*0.5
 
-        dist.barrier() # syncronize
+        if dist.is_initialized() and dist.is_available():
+            dist.barrier() # syncronize
 
 def test(res):
     ### test on best model
@@ -171,11 +201,19 @@ def test(res):
     with torch.no_grad():
         test_res = run(0, dataloaders['test'], partition='test')
 
-    pred = [torch.zeros_like(test_res['score']) for _ in range(dist.get_world_size())]
-    dist.all_gather(pred, test_res['score'] )
-    pred = torch.cat(pred).cpu()
+    # pred = [torch.zeros_like(test_res['score']) for _ in range(dist.get_world_size())]
+    # dist.all_gather(pred, test_res['score'] )
+    # pred = torch.cat(pred).cpu()
 
-    if (args.local_rank == 0):
+    if use_ddp:
+        pred = [torch.zeros_like(test_res['score']) for _ in range(dist.get_world_size())]
+        dist.all_gather(pred, test_res['score'])
+        pred = torch.cat(pred).cpu()
+    else:
+        pred = test_res['score'].cpu()
+
+
+    if (local_rank == 0):
         np.save(f"{args.logdir}/{args.exp_name}/score.npy",pred)
         fpr, tpr, thres, eB, eS  = utils.buildROC(pred[...,0], pred[...,2])
         auc = utils.roc_auc_score(pred[...,0], pred[...,2])
@@ -195,32 +233,92 @@ if __name__ == "__main__":
     utils.args_init(args)
 
     ### set random seed
-    torch.manual_seed(args.seed + args.local_rank)
-    np.random.seed(args.seed + args.local_rank)
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
     ### initialize cuda
-    dist.init_process_group(backend='nccl')
-    device = torch.device("cuda:{}".format(args.local_rank))
-    dtype = torch.float32
+    # dist.init_process_group(backend='nccl')
+    # dist.init_process_group(backend='nccl',init_method='env://',timeout=timedelta(minutes=60))
+    # device = torch.device(f"cuda:{local_rank}")
+    # dtype = torch.float32
 
-    ### load data
+    ### initialize cuda / DDP
+    use_ddp = ('RANK' in os.environ) and ('WORLD_SIZE' in os.environ)
+    
+
+    if use_ddp:
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            timeout=timedelta(minutes=60)
+        )
+        # Asegura el device por rank
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        print(f"🚀 Ejecutando en DDP (rank={dist.get_rank()}/{dist.get_world_size()})")
+    else:
+        print("⚙️ Ejecutando en GPU única (sin DDP)…")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    dtype = torch.float32
+    
+
+
+    # ### load data
     train_sampler, dataloaders = dataset.retrieve_dataloaders(
                                         args.batch_size,
                                         num_data=-1, # use all data
                                         cache_dir=args.datadir,
                                         num_workers=args.num_workers,
                                         use_one_hot=True)
+    
+    # --- Inferir n_scalar (ancho de 'nodes') una sola vez y compartirlo ---
+    if use_ddp:
+        dist.barrier()
+
+    if (not use_ddp) or dist.get_rank() == 0:
+        # sample: (label, p4s, nodes, atom_mask, edge_mask, edges)
+        sample = next(iter(dataloaders['train']))
+        inferred_n_scalar = int(sample[2].shape[-1])  # nodes.shape[-1]
+        print(f"[infer] n_scalar = {inferred_n_scalar}", flush=True)
+    else:
+        inferred_n_scalar = 0
+
+    t = torch.tensor([inferred_n_scalar], device=device, dtype=torch.int64)
+    if use_ddp:
+        dist.broadcast(t, src=0)
+    n_scalar = int(t.item())
+
 
     ### create parallel model
-    model = LorentzNet(n_scalar = 8, n_hidden = args.n_hidden, n_class = 2,
+    model = LorentzNet(n_scalar = n_scalar, n_hidden = args.n_hidden, n_class = 2,
                        dropout = args.dropout, n_layers = args.n_layers,
                        c_weight = args.c_weight)
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    if use_ddp:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        
     model = model.to(device)
-    ddp_model = DistributedDataParallel(model, device_ids=[args.local_rank])
+    # --- Diagnóstico de shapes entre ranks ---
+    first_shape = tuple(next(model.parameters()).shape)
+    if use_ddp:
+        objs = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(objs, first_shape)
+        if dist.get_rank() == 0:
+            print(">>> Shapes del primer parámetro por rank:", objs, flush=True)
+        assert all(s == objs[0] for s in objs), f"Arquitecturas distintas entre ranks: {objs}"
+
+    # ddp_model = DistributedDataParallel(model, device_ids=[local_rank],output_device=local_rank)
+
+    if use_ddp:
+        ddp_model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+    else:
+        ddp_model = model
+
 
     ### print model and dataset information
-    if (args.local_rank == 0):
+    if (local_rank == 0):
         pytorch_total_params = sum(p.numel() for p in ddp_model.parameters())
         print("Network Size:", pytorch_total_params)
         for (split, dataloader) in dataloaders.items():
