@@ -2,7 +2,8 @@ import os
 import random
 from datetime import timedelta
 from qg import dataset
-from models import LorentzNet
+from modelsQC import LorentzEQGNN
+#from models import LorentzNet
 import torch
 from torch import nn, optim
 import argparse, json, time
@@ -51,7 +52,7 @@ parser.add_argument('--lr', type=float, default=1e-3, metavar='N',
 parser.add_argument('--n_hidden', type=int, default=72, metavar='N',
                     help='dim of latent space')
 parser.add_argument('--n_layers', type=int, default=6, metavar='N',
-                    help='number of LGEBs')
+                    help='number of LEQBs')
 parser.add_argument('--num_workers', type=int, default=4, metavar='N',
                     help='number of workers for the dataloader')
 parser.add_argument('--weight_decay', type=float, default=1e-2, metavar='N',
@@ -293,7 +294,7 @@ if __name__ == "__main__":
 
 
     ### create parallel model
-    model = LorentzNet(n_scalar = n_scalar, n_hidden = args.n_hidden, n_class = 2,
+    model = LorentzEQGNN(n_scalar = n_scalar, n_hidden = args.n_hidden, n_class = 2,
                        dropout = args.dropout, n_layers = args.n_layers,
                        c_weight = args.c_weight)
     if use_ddp:
